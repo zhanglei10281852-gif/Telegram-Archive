@@ -53,7 +53,9 @@ Always start with a dry run. It parses and checks the export without writing to 
     telegram-archive --data-dir ./data import -p ./data/import/<folder>
     ```
 
-`-p` names the export folder. For an HTML export, pass the chat id in marked form with `-c`, for example `-1001234567890` for a supergroup or channel. With a multi-chat JSON export, `-c` imports only the first chat, under that id. For every flag, see [import](../reference/cli.md#import).
+`-p` names the export folder. For an HTML export, pass the chat id in marked form with `-c`, for example `-c -1001234567890` for a supergroup or channel. With a multi-chat JSON export, `-c` imports only the first chat, under that id. For every flag, see [import](../reference/cli.md#import).
+
+In an archive with several accounts, name the target with `--account <id|label>`. A full-account JSON export needs no flag: the importer matches `personal_information.user_id` to the existing account automatically, and an explicit `--account` that names a different account is rejected before anything is written. HTML exports and single-chat JSON exports cannot identify their owner, so they require `--account` when more than one account exists. A single-account install keeps working with no flags.
 
 When it finishes, the command prints `Import complete:` with the number of chats, messages and media files, then one line per chat with its id, message count and media count.
 
@@ -66,7 +68,7 @@ When it finishes, the command prints `Import complete:` with the number of chats
 - It refuses to import into a chat that already has messages, unless you pass `--merge`.
 - From a JSON export it keeps locations, venues, live locations, shared contacts and polls in the message data, under the same keys the backup uses, so the viewer shows them as cards. The export has no poll option ids, so an imported poll numbers its answers. An HTML export has none of these details.
 - It copies media files into `media/<chat_id>/` in the archive. The export must stay readable for the whole run, and the copies need free disk space of their own. Media the archive already holds for a message is skipped. A photo's width and height come from a JSON export as written. An HTML export gives only its thumbnail's size, so the importer reads the photo's size from the file's header instead.
-- Everything is written under account 1, even when the install has several accounts.
+- Everything is written under one resolved account. A full-account JSON export auto-matches its owner to that account's row; in a multi-account archive `--account` selects it for HTML and single-chat exports, and a wrong or ambiguous choice is rejected before any write. Re-running an interrupted import resumes only the same account's progress.
 - Only a full-account JSON export tells the importer which messages you sent. HTML and single-chat exports leave that flag unset.
 - When an HTML export date carries a `UTC+HH:MM` suffix, the time is converted to UTC. Without the suffix the time is stored as written, as the exporting computer's local time.
 

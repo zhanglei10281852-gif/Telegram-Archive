@@ -1895,6 +1895,22 @@ class DatabaseAdapter:
             result = await session.execute(select(Account.id, Account.label).order_by(Account.id))
             return [{"id": row[0], "label": row[1]} for row in result]
 
+    async def get_account_identities(self) -> list[dict[str, Any]]:
+        """Every account's ``{"id", "label", "telegram_user_id"}``, ascending.
+
+        SERVER-SIDE ONLY, alongside ``ensure_account`` and ``_account_owner_ids``:
+        the Telegram user id is PII and must never reach a browser or a log.
+        The Telegram Desktop importer is the one consumer that needs all three
+        columns together — it matches a full export's
+        ``personal_information.user_id`` to an existing account and resolves an
+        explicit ``--account`` id/label before writing a single row.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            result = await session.execute(
+                select(Account.id, Account.label, Account.telegram_user_id).order_by(Account.id)
+            )
+            return [{"id": row[0], "label": row[1], "telegram_user_id": row[2]} for row in result]
+
     async def _account_owner_ids(self) -> dict[int, int]:
         """``{telegram_user_id: account_id}`` for accounts that have logged in.
 

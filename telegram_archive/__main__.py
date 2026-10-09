@@ -190,6 +190,16 @@ For more information, visit: https://github.com/GeiserX/Telegram-Archive
     import_parser.add_argument(
         "--merge", action="store_true", help="Allow importing into a chat that already has messages"
     )
+    import_parser.add_argument(
+        "--account",
+        metavar="ID_OR_LABEL",
+        default=None,
+        help=(
+            "Target account: its numeric id or its label. A full JSON export auto-detects the "
+            "owner from personal_information; required for HTML and single-chat exports when the "
+            "archive has more than one account."
+        ),
+    )
 
     # Fill gaps command
     fill_gaps_parser = subparsers.add_parser(
@@ -489,7 +499,12 @@ async def run_import(args) -> int:
         setup_logging(config)
         config.log_summary()
 
-        importer = await TelegramImporter.create(config.media_path, config.max_filename_bytes)
+        importer = await TelegramImporter.create(
+            config.media_path,
+            config.max_filename_bytes,
+            account=getattr(args, "account", None),
+            configured_account_count=len(config.accounts),
+        )
         try:
             summary = await importer.run(
                 export_path=args.path,
@@ -500,6 +515,8 @@ async def run_import(args) -> int:
             )
             prefix = "[DRY RUN] " if args.dry_run else ""
             print(f"\n{prefix}Import complete:")
+            if summary.get("account_id") is not None:
+                print(f"  Account: {summary['account_id']}")
             print(f"  Chats: {summary['chats_imported']}")
             print(f"  Messages: {summary['total_messages']}")
             print(f"  Media files: {summary['total_media']}")

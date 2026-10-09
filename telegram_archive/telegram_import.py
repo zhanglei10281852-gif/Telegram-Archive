@@ -77,6 +77,18 @@ HTML_FOLDER_MEDIA_TYPE = {
 }
 
 
+class ImportAccountError(ValueError):
+    """The import's target account cannot be resolved safely.
+
+    Raised after READ-ONLY checks only — the export is parsed just far enough
+    to learn its shape and owner, and the accounts table is only read — so a
+    conflict, a missing/ambiguous account or a missing explicit choice in a
+    multi-account install rejects the import with zero rows written and zero
+    media copied. A subclass of ``ValueError`` so the CLI and callers that
+    already catch ``ValueError`` keep handling it.
+    """
+
+
 def parse_from_id(from_id: str | None) -> int | None:
     """Parse Telegram Desktop's from_id string into a numeric ID.
 
@@ -809,6 +821,164 @@ def _stream_export(fileobj):
 
 
 # ---------------------------------------------------------------------------
+# Target-account resolution (multi-account imports)
+# ---------------------------------------------------------------------------
+#
+# Every row the importer writes carries accounts.id, so the account must be
+# known BEFORE the first write. A full-account JSON export names its owner in
+# personal_information.user_id (Telegram Desktop writes that block before
+# chats); that id matches exactly one existing accounts row. HTML and
+# single-chat JSON exports cannot name an owner, so in an install with several
+# accounts the operator must choose the target explicitly. The peek below is a
+# read-only prefix scan of result.json: it stops at the first top-level
+# chats/messages key and never touches the chat contents, so a multi-GB export
+# costs one small read regardless of size.
+
+
+def peek_export_identity(result_file: Path) -> tuple[str, int | None]:
+    """Read-only prefix scan of result.json -> (shape, owner_user_id).
+
+    ``shape`` is ``"full"`` (top-level ``chats``) or ``"single"`` (top-level
+    ``messages``); ``owner_user_id`` is personal_information.user_id when that
+    block precedes the chats/messages key, exactly the order Telegram Desktop
+    writes. A file that names neither key is reported as ``"full"`` with no
+    owner; the main import path then produces the existing "No chats found"
+    error. Nothing here or in its caller writes anything.
+    """
+    owner: int | None = None
+    owner_builder = None
+    with open(result_file, "rb") as handle:
+        for prefix, event, value in ijson.parse(handle, use_float=True):
+            if owner_builder is not None:
+                owner_builder.event(event, value)
+                if prefix == "personal_information" and event == "end_map":
+                    info = owner_builder.value
+                    owner_builder = None
+                    if isinstance(info, dict) and info.get("user_id") is not None:
+                        try:
+                            owner = int(info["user_id"])
+                        except (TypeError, ValueError):
+                            owner = None
+                continue
+            if prefix == "" and event == "map_key":
+                if value == "chats":
+                    return "full", owner
+                if value == "messages":
+                    return "single", owner
+            elif prefix == "personal_information" and event == "start_map":
+                owner_builder = ijson.ObjectBuilder()
+                owner_builder.event(event, value)
+    return "full", owner
+
+
+def _account_label(row: dict[str, Any]) -> str:
+    """Operator-facing label for an error message; the surrogate id is the anchor."""
+    label = row.get("label")
+    return f" (label {label!r})" if isinstance(label, str) and label else ""
+
+
+def _numeric_text(value: str) -> bool:
+    """A plain integer token (optionally signed) — argparse hands --account over as text."""
+    return bool(value) and (value.isdigit() or (value[0] in "+-" and value[1:].isdigit()))
+
+
+async def resolve_import_account(
+    db: DatabaseAdapter,
+    *,
+    selector: int | str | None,
+    owner_user_id: int | None,
+    configured_account_count: int | None = None,
+) -> int:
+    """Resolve the accounts.id every row of this import belongs to.
+
+    Decision order, all read-only:
+
+    * Explicit selector (stable accounts.id or label) wins, subject to one
+      check: a full export whose owner already matches a DIFFERENT existing
+      account is refused rather than mis-imported. An unknown id, a label that
+      matches zero or several accounts, and that owner conflict all raise.
+    * Without a selector, a known owner maps to its one account; several rows
+      carrying the same owner is an ambiguous database and also raises.
+    * With no owner (HTML, single-chat JSON, missing personal_information) or
+      an owner this archive does not know, an install with more than one
+      account requires an explicit selector.
+    * A single configured account keeps the legacy behavior: the sole row is
+      used, and an un-migrated database with no accounts rows still lands on
+      the migration-seeded account 1.
+    """
+    rows = await db.get_account_identities()
+    existing_count = len(rows)
+    declared = configured_account_count if configured_account_count is not None else 0
+    multi_account = max(existing_count, declared) > 1
+
+    if selector is not None and not isinstance(selector, bool):
+        selected: int | None = None
+        if isinstance(selector, int):
+            selected = selector
+            if not any(row["id"] == selected for row in rows):
+                raise ImportAccountError(
+                    f"Account {selected} does not exist. Choose an existing account id or label."
+                )
+        else:
+            text = str(selector).strip()
+            if not text:
+                raise ImportAccountError("No account selected: --account needs an account id or a label.")
+            if _numeric_text(text):
+                selected = int(text)
+                if not any(row["id"] == selected for row in rows):
+                    raise ImportAccountError(
+                        f"Account {selected} does not exist. Choose an existing account id or label."
+                    )
+            else:
+                matches = [row for row in rows if isinstance(row.get("label"), str) and row["label"] == text]
+                if not matches:
+                    known = ", ".join(f"{row['id']}{_account_label(row)}" for row in rows) or "none yet"
+                    raise ImportAccountError(
+                        f"No account has the label {text!r}. Existing accounts: {known}."
+                    )
+                if len(matches) > 1:
+                    ids = ", ".join(str(row["id"]) for row in matches)
+                    raise ImportAccountError(
+                        f"Label {text!r} is used by accounts {ids}; select by numeric account id instead."
+                    )
+                selected = matches[0]["id"]
+
+        if owner_user_id is not None:
+            owner_rows = [row for row in rows if row.get("telegram_user_id") == owner_user_id]
+            if owner_rows and not any(row["id"] == selected for row in owner_rows):
+                owner = owner_rows[0]
+                raise ImportAccountError(
+                    f"The export belongs to account {owner['id']}{_account_label(owner)}, "
+                    f"not to the selected account {selected}. Re-run without --account to use the "
+                    "export owner, or export the selected account's own data."
+                )
+        return selected
+
+    if owner_user_id is not None:
+        owner_rows = [row for row in rows if row.get("telegram_user_id") == owner_user_id]
+        if len(owner_rows) > 1:
+            ids = ", ".join(str(row["id"]) for row in owner_rows)
+            raise ImportAccountError(
+                f"The export owner matches several accounts ({ids}); select the target with --account."
+            )
+        if len(owner_rows) == 1:
+            return owner_rows[0]["id"]
+
+    if multi_account:
+        known = ", ".join(f"{row['id']}{_account_label(row)}" for row in rows) or "none yet"
+        raise ImportAccountError(
+            "This archive has more than one account and the export cannot identify its owner "
+            "(HTML and single-chat exports carry no personal_information, and a full export without "
+            "it cannot be auto-matched). Name the target account with --account <id|label>. "
+            f"Existing accounts: {known}."
+        )
+
+    # Legacy single-account installs: the one existing row, or account 1 on a
+    # database that predates the accounts table seeding.
+    return rows[0]["id"] if rows else DEFAULT_ACCOUNT_ID
+
+
+# ---------------------------------------------------------------------------
 # Main importer
 # ---------------------------------------------------------------------------
 
@@ -816,10 +986,28 @@ def _stream_export(fileobj):
 class TelegramImporter:
     """Import Telegram Desktop exports into Telegram-Archive database."""
 
-    def __init__(self, db: DatabaseAdapter, media_path: str, max_filename_bytes: int = 143, *, account_id: int):
+    def __init__(
+        self,
+        db: DatabaseAdapter,
+        media_path: str,
+        max_filename_bytes: int = 143,
+        *,
+        account_id: int | None = None,
+        account: int | str | None = None,
+        configured_account_count: int | None = None,
+    ):
         self.db = db
-        # accounts.id every row written by this import belongs to.
+        # accounts.id every row written by this import belongs to. ``None``
+        # until run() resolves it once, BEFORE any write: a pre-resolved id
+        # (tests and programmatic callers) skips resolution; the CLI passes an
+        # explicit selector and lets the export owner auto-match otherwise.
         self.account_id = account_id
+        # Explicit --account: a stable accounts.id (int or numeric text) or a label.
+        self._account_selector = account
+        # Number of TG_ACCOUNT_<N> accounts the install declares, even when the
+        # extra accounts rows do not exist yet (pre-login). Widens the
+        # "several accounts, must choose" gate; None uses the database alone.
+        self._configured_account_count = configured_account_count
         self.media_path = media_path
         self.media_root = Path(media_path).resolve()
         self.max_filename_bytes = max_filename_bytes
@@ -828,12 +1016,26 @@ class TelegramImporter:
         self._owner_user_id: int | None = None
 
     @classmethod
-    async def create(cls, media_path: str, max_filename_bytes: int = 143) -> TelegramImporter:
+    async def create(
+        cls,
+        media_path: str,
+        max_filename_bytes: int = 143,
+        *,
+        account: int | str | None = None,
+        configured_account_count: int | None = None,
+    ) -> TelegramImporter:
         await init_database()
         db = await get_adapter()
-        # Single-account stage: imports land under the migration-seeded account.
-        # Phase 5 replaces the constant with real per-account resolution here.
-        return cls(db, media_path, max_filename_bytes, account_id=DEFAULT_ACCOUNT_ID)
+        # The target account is resolved in run(), after a read-only peek at
+        # the export: full JSON auto-matches personal_information.user_id to an
+        # existing accounts row, and --account (id/label) overrides/selects.
+        return cls(
+            db,
+            media_path,
+            max_filename_bytes,
+            account=account,
+            configured_account_count=configured_account_count,
+        )
 
     async def close(self) -> None:
         await close_database()
@@ -855,7 +1057,33 @@ class TelegramImporter:
         result_file = _resolve_export_control_file(path, path / "result.json")
         html_files = _find_html_files(path)
 
+        if result_file is None and not html_files:
+            raise FileNotFoundError(
+                f"No result.json or messages.html found in {path}. Expected a Telegram Desktop export directory."
+            )
+
+        # Resolve the target account ONCE, before any database or filesystem
+        # write. The peek is a read-only prefix scan; resolution only reads the
+        # accounts table. A failure here is therefore side-effect free.
+        if self.account_id is None:
+            if result_file is not None:
+                _shape, owner_user_id = peek_export_identity(result_file)
+            else:
+                owner_user_id = None
+            self.account_id = await resolve_import_account(
+                self.db,
+                selector=self._account_selector,
+                owner_user_id=owner_user_id,
+                configured_account_count=self._configured_account_count,
+            )
+            # The streaming pass re-derives this from personal_information; on
+            # the single-chat/HTML paths no such event exists, so keep the
+            # peek's answer (None there) as the single source of truth.
+            self._owner_user_id = owner_user_id
+        account_id = self.account_id
+
         summary: dict[str, Any] = {
+            "account_id": account_id,
             "chats_imported": 0,
             "chats_skipped": 0,
             "total_messages": 0,
@@ -897,10 +1125,6 @@ class TelegramImporter:
             summary["total_messages"] += result["messages"]
             summary["total_media"] += result["media"]
             summary["details"].append(result)
-        else:
-            raise FileNotFoundError(
-                f"No result.json or messages.html found in {path}. Expected a Telegram Desktop export directory."
-            )
 
         return summary
 
@@ -1032,14 +1256,40 @@ class TelegramImporter:
             marker = json.loads(raw)
         except TypeError, ValueError:
             return None
-        return marker if isinstance(marker, dict) else None
+        if not isinstance(marker, dict):
+            return None
+        # The marker key is already per-account (account_metadata_key), and
+        # the fingerprint pins the export file; the embedded account id is the
+        # third, explicit guard so a crashed run can only ever resume ITS OWN
+        # account's progress and never continue or clear another account's.
+        marker_account = marker.get("account_id")
+        if marker_account is None:
+            # A marker written before multi-account imports always tracked the
+            # default account under the bare legacy key. Any other account must
+            # ignore it rather than adopt a stranger's completed set.
+            if self.account_id != DEFAULT_ACCOUNT_ID:
+                logger.warning("Ignoring a legacy import progress marker while importing a non-default account")
+                return None
+        elif marker_account != self.account_id:
+            raise ImportAccountError(
+                f"Import progress for this export belongs to account {marker_account}, not account "
+                f"{self.account_id}. Re-run with the same account to resume it; no progress was changed."
+            )
+        return marker
 
     async def _save_import_marker(
         self, marker_key: str, fingerprint: str, completed: set[int], started: int | None
     ) -> None:
         await self.db.set_metadata(
             marker_key,
-            json.dumps({"fingerprint": fingerprint, "completed": sorted(completed), "started": started}),
+            json.dumps(
+                {
+                    "fingerprint": fingerprint,
+                    "completed": sorted(completed),
+                    "started": started,
+                    "account_id": self.account_id,
+                }
+            ),
         )
 
     def _extract_chats(self, data: dict) -> list[dict]:
@@ -1276,6 +1526,7 @@ class TelegramImporter:
         logger.info(f"{action} {msg_count} messages and {media_count} media files")
 
         return {
+            "account_id": self.account_id,
             "chat_id": chat_id,
             "chat_name": chat_name,
             "messages": msg_count,

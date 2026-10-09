@@ -259,16 +259,19 @@ It exits 0 on success. On failure it prints `List chats failed: <error>` on stde
 ## import { #import }
 
 ```text
-telegram-archive [--data-dir PATH] import -p DIR [-c CHAT_ID] [--dry-run] [--skip-media] [--merge]
+telegram-archive [--data-dir PATH] import -p DIR [-c CHAT_ID] [--account ID_OR_LABEL] [--dry-run] [--skip-media] [--merge]
 ```
 
 | Short | Long | Argument | Required | Meaning |
 |-------|------|----------|----------|---------|
 | `-p` | `--path` | `DIR` | yes | Telegram Desktop export folder, holding `result.json` or `messages.html`. |
 | `-c` | `--chat-id` | `CHAT_ID` | for HTML exports | Chat id in marked format, for example `-1001234567890`. |
+| | `--account` | `ID_OR_LABEL` | see below | Target account: its numeric id or its label. |
 | | `--dry-run` | | no | Parse and validate without writing to the database or copying media. |
 | | `--skip-media` | | no | Import messages and metadata only. |
 | | `--merge` | | no | Allow importing into a chat that already has messages. |
+
+`--account` names the account every imported chat, message, media row and sync status belongs to. A full JSON export auto-detects its owner from `personal_information.user_id` and matches the existing account, so no flag is needed; `--account` is then only checked for agreement and a conflicting choice stops the import with no writes. HTML exports and single-chat JSON exports carry no owner, so in an archive with more than one account `--account` is required. An archive with a single account keeps accepting imports with no flag. A numeric value selects by account id; any other text selects by label, and a missing or duplicate label stops the import. The interrupted-import resume marker is bound to the account, so re-running continues only that account's progress.
 
 Imports a Telegram Desktop export into the archive. Formats, resuming and the other details are in [Import and maintenance tasks](../operations/maintenance.md).
 

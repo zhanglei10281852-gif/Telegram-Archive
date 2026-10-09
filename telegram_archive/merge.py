@@ -24,6 +24,7 @@ Privacy: every message this module raises or returns names tables, counts and
 account row ids only, never a chat id, a path, a title or message content.
 """
 
+import json
 import os
 import re
 import shutil
@@ -543,13 +544,41 @@ def remap_metadata_key(key: str, account_map: dict[int, int]) -> str | None:
     return account_metadata_key(match["base"], account_map[account])
 
 
+def _remap_import_marker_value(value: str, target_account: int) -> str:
+    """Rewrite the account embedded in an import-progress marker, if present.
+
+    The key remap alone is not enough: the importer's resume marker also names
+    its account INSIDE its JSON, and the importer refuses to continue a marker
+    owned by another account. After a merge the interrupted import genuinely
+    belongs to the remapped target account, so the embedded id moves with it.
+    Anything that is not such a marker (the legacy bare-text value included)
+    is returned byte-identical.
+    """
+    try:
+        marker = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    if not isinstance(marker, dict) or "account_id" not in marker:
+        return value
+    marker["account_id"] = target_account
+    return json.dumps(marker)
+
+
 def account_metadata_rows(source: Connection, account_map: dict[int, int]) -> list[dict[str, Any]]:
     """The source's per-account metadata rows, re-keyed for the target."""
     rows = []
     for key, value in source.execute(sa.select(Metadata.key, Metadata.value)).all():
-        new_key = remap_metadata_key(key, account_map)
-        if new_key is not None:
-            rows.append({"key": new_key, "value": value})
+        match = ACCOUNT_METADATA_KEY.match(key)
+        if match is None:
+            continue
+        source_account = int(match["account"]) if match["account"] else DEFAULT_ACCOUNT_ID
+        if source_account not in account_map:
+            continue
+        target_account = account_map[source_account]
+        new_key = account_metadata_key(match["base"], target_account)
+        if match["base"] == "import_progress":
+            value = _remap_import_marker_value(value, target_account)
+        rows.append({"key": new_key, "value": value})
     return rows
 
 
