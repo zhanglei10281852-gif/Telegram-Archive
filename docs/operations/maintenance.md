@@ -339,7 +339,7 @@ Stop the backup service before a run that changes data, and take a backup first.
 - `fix_media_sizes.py` is broken and fails on every run. Use `update_media_sizes.py` instead.
 - `cleanup_legacy_avatars.py` deletes old-style avatar files that already have a new-style replacement. Run it with `--dry-run` first and take a backup. It reads `--backup-path`, default `/data/backups`.
 
-`migrate_media_paths.py` builds its database address from `DATABASE_URL`, then `DB_TYPE` and the `POSTGRES_*` variables, then `BACKUP_PATH/telegram_backup.db`. Pass `--db-url` if your database lives elsewhere.
+`migrate_media_paths.py` builds its database address from `DATABASE_URL`, then `DB_TYPE` and the `POSTGRES_*` variables, then `BACKUP_PATH/telegram_backup.db`. Pass `--db-url` if your database lives elsewhere. It first prints a migration plan and applies it only when no same-name target holds different content; such a conflict changes nothing (including during `--dry-run`) and exits non-zero. A run interrupted between moving files and committing the database is resumed by rerunning the script — it re-plans from the current state.
 
 `generate_dummy_db.py` migrates the new database to the current schema before filling it. It needs `ffmpeg` on the `PATH` to make the voice notes and the round video. Without it, those messages keep their rows but get no file. It stops if the target folder already holds an archive.
 

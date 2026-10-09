@@ -479,7 +479,7 @@ Most of them find the database through the same variables as the application. `m
 | `update_media_sizes.py` | Fills in missing media file sizes from the files on disk. | `--dry-run`, `--force` |
 | `normalize_grouped_ids.py` | Stores every album id in the same form. | `--dry-run` |
 | `cleanup_legacy_avatars.py` | Deletes old-style avatar files that have a new-style replacement. | `--dry-run`, `--backup-path PATH` (default `/data/backups`) |
-| `migrate_media_paths.py` | Renames old media folders of groups and channels to their marked ids and updates the database paths. | `--dry-run`, `--media-path PATH` (default `$MEDIA_PATH` or `/data/backups/media`), `--db-url URL` |
+| `migrate_media_paths.py` | Renames old media folders of groups and channels to their marked ids and updates the database paths. It plans folders, database rows and avatars before writing anything: a same-name target is removed only when its contents hash equal, and content that differs stops the run with nothing changed. Each chat commits its database rewrite only after its files have moved, so an interrupted run resumes safely by rerunning it. | `--dry-run`, `--media-path PATH` (default `$MEDIA_PATH` or `/data/backups/media`), `--db-url URL` |
 | `healthcheck_backup.py`, `healthcheck_viewer.py` | The container health checks described above. | none |
 | `fix_reactions_sequence.sql`, `migrate_to_marked_ids.sql`, `migrate_to_marked_ids_sqlite.sql` | SQL helpers. Run them with `sqlite3` or `psql` outside the image. | none |
 | `generate_dummy_db.py` | A development tool that builds a demo archive. | `--data-dir`, `--force` |
