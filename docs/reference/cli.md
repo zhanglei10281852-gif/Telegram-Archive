@@ -473,7 +473,7 @@ Most of them find the database through the same variables as the application. `m
 |--------|---------|-------|
 | `auth_noninteractive.py` | Logs in without a terminal, in two steps. `send` requests the code and stores its hash beside the session file. `verify` signs in with the code, and the 2FA password when one is set. It covers the single legacy account only, from `TELEGRAM_*` variables. See [Log in to Telegram](../getting-started/telegram-login.md#log-in-without-a-terminal). | `send`, then `verify CODE [2FA_PASSWORD]`. `TELEGRAM_PHONE_CODE_HASH` can replace the stored hash. |
 | `migrate-sqlite-to-postgres.py` | Copies a SQLite archive into an empty PostgreSQL database and checks the row counts. Stop the backup container first. See [SQLite and PostgreSQL](../configuration/database.md#move-an-existing-sqlite-archive-to-postgresql). | `-s`/`--sqlite PATH`, `-p`/`--postgres URL`, `-b`/`--batch-size N` (default 1000), `-v`/`--verify-only`, `-n`/`--dry-run` |
-| `restore_chat.py` | Re-sends archived messages into a Telegram chat as the Telegram account of the session. Each message carries its original sender and time in its text. Media is uploaded again as new files. Each file of a message becomes its own Telegram message: the first carries the text, the others follow without it, downloaded files first, then by media id, so the text is sent once. A file that hits a flood or slow-mode wait is sent again after the wait. | See below. |
+| `restore_chat.py` | Re-sends archived messages into a Telegram chat as the Telegram account of the session, as a resumable job. Each message carries its original sender and time in its text. Media is uploaded again as new files. Each file of a message becomes its own Telegram message: the first carries the text, the others follow without it, downloaded files first, then by media id, so the text is sent once. A file that hits a flood or slow-mode wait is sent again after the wait. The run's source, destination, filters, media order and every confirmed send are bound to a job file; re-running the same command continues only unconfirmed sends. | See below. |
 | `detect_albums.py` | Groups media sent close together into albums in older archives. | `--dry-run`, `--window SECONDS` (default 2) |
 | `deduplicate_media.py` | Moves duplicate media files into `media/_shared` and links them from the chat folders. | `--dry-run`, `-v`/`--verbose` |
 | `update_media_sizes.py` | Fills in missing media file sizes from the files on disk. | `--dry-run`, `--force` |
@@ -493,6 +493,8 @@ Most of them find the database through the same variables as the application. `m
 python scripts/restore_chat.py (--chat ID | --source-chat ID --dest-chat ID)
     [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--limit N]
     [--delay SECONDS] [--no-media] [--dry-run]
+    [--job-dir DIR] [--restart]
+    [--resend-unconfirmed | --mark-unconfirmed-sent]
 ```
 
 | Flag | Argument | Meaning |
@@ -505,9 +507,17 @@ python scripts/restore_chat.py (--chat ID | --source-chat ID --dest-chat ID)
 | `--limit` | `N` | At most this many messages. |
 | `--delay` | `SECONDS` | Pause between messages, and between the files of one message. Default 2.0. |
 | `--no-media` | | Send text only. |
-| `--dry-run` | | Show what would be sent without sending. |
+| `--dry-run` | | Build the send plan and show it without sending, and without writing a job file. |
+| `--job-dir` | `DIR` | Where job state files live. Default `$RESTORE_JOB_DIR`, else `$BACKUP_PATH/restore_jobs`. |
+| `--restart` | | Start a fresh job instead of resuming the saved one. Messages already sent are not undone and will be sent again. |
+| `--resend-unconfirmed` | | Resume a job stopped at an unconfirmed send by sending that unit again. Use after checking the message did not arrive. |
+| `--mark-unconfirmed-sent` | | Resume a job stopped at an unconfirmed send by recording it as delivered without sending. Use after checking the message did arrive. |
 
 The session is `SESSION_PATH` when set. Otherwise it is `SESSION_DIR` joined with `SESSION_NAME`, and `SESSION_DIR` defaults to `/data/session`. It reads `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`.
+
+Every real run is a resumable job. Its state file binds the source chat, destination chat, the date/limit/`--no-media` filters, the exact media order and the confirmed Telegram result of every text, caption and file send (with the destination message id). Re-running the same command resumes that job: confirmed text, captions and files are never sent twice, and only unconfirmed units go out, so a run interrupted by a network drop or a killed process ends with exactly what one successful run would have sent. Different arguments make a separate job. Job files are written atomically before the first connection and after every confirmed send.
+
+A send whose delivery cannot be determined — a connection or timeout error, a process killed while the send was in flight, or a reply without a message id — stops the job at that unit and prints diagnostics (source message, file, whether it carried the caption, the last error, the job file). It is never resent blindly, because a blind resend duplicates a send that actually landed, and later messages are not skipped over. Check the destination chat, then resume with `--resend-unconfirmed` when the send is absent or `--mark-unconfirmed-sent` when it is present. Interruption, an unreachable target and the error threshold all save the job, disconnect the client and exit without printing `RESTORE COMPLETE`; the exit code is 2 for an unconfirmed send, 130 on interruption and 1 for other stops. A resumed job whose backup changed since it was built (message order, text or media) stops with a plan-drift error instead of guessing; use `--restart` after reviewing it.
 
 !!! danger "It sends real messages"
     Stop the backup service first. See [One client per session](../getting-started/telegram-login.md#one-client-per-session). Always run it with `--dry-run` first and read what it would send.
