@@ -664,16 +664,17 @@ async def migrate(db_url: str, media_path: str, dry_run: bool = True) -> RunResu
             stats["avatars_moved"] += avatar_stats["moves"]
             stats["avatar_duplicates_removed"] += avatar_stats["dedups"]
 
-    except MigrationError as exc:
+    except (MigrationError, sa.exc.SQLAlchemyError) as exc:
         # Deliberately type-name safe messages already; never interpolate raw
         # OSError text because it carries a media path with a chat-id folder.
+        error = str(exc) if isinstance(exc, MigrationError) else f"database transaction failed: {type(exc).__name__}"
         logger.error("")
-        logger.error(f"MIGRATION INTERRUPTED: {exc}")
+        logger.error(f"MIGRATION INTERRUPTED: {error}")
         logger.error(
             "The archive is left in a resumable state. Fix the cause and rerun; "
             "the next run continues from the current state."
         )
-        return RunResult("failed", stats, str(exc))
+        return RunResult("failed", stats, error)
     finally:
         await engine.dispose()
 

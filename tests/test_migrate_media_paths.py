@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -435,6 +436,57 @@ async def test_failed_stage_is_not_reported_complete_and_rerun_converges(tmp_pat
     assert media_paths == ["-352/a.jpg"]
 
 
+async def test_database_commit_failure_is_reported_failed_and_rerun_converges(tmp_path, monkeypatch):
+    media = tmp_path / "media"
+    old = media / "352"
+    old.mkdir(parents=True)
+    (old / "a.jpg").write_bytes(b"photo-a")
+    db = tmp_path / "archive.db"
+    url = await _make_legacy_db(db, [-352], media_paths=["352/a.jpg"])
+
+    real_create_async_engine = mod.create_async_engine
+    created = []
+
+    def engine_with_failing_commit(*args, **kwargs):
+        engine = real_create_async_engine(*args, **kwargs)
+        created.append(engine)
+        if len(created) == 1:
+            fired = {"value": False}
+
+            def fail_first_commit(_connection):
+                if not fired["value"]:
+                    fired["value"] = True
+                    raise sa.exc.OperationalError("COMMIT", {}, RuntimeError("injected commit failure"))
+
+            sa.event.listen(engine.sync_engine, "commit", fail_first_commit)
+        return engine
+
+    monkeypatch.setattr(mod, "create_async_engine", engine_with_failing_commit)
+    failed = await mod.migrate(url, str(media), dry_run=False)
+    monkeypatch.undo()
+
+    assert failed.status == "failed"
+    assert failed.error == "database transaction failed: OperationalError"
+    assert not old.exists()
+    assert (media / "-352" / "a.jpg").read_bytes() == b"photo-a"
+
+    engine = await _connect(db)
+    try:
+        media_paths, _, _ = await _all_paths(engine)
+    finally:
+        await engine.dispose()
+    assert media_paths == ["352/a.jpg"]
+
+    resumed = await mod.migrate(url, str(media), dry_run=False)
+    assert resumed.status == "applied"
+    engine = await _connect(db)
+    try:
+        media_paths, _, _ = await _all_paths(engine)
+    finally:
+        await engine.dispose()
+    assert media_paths == ["-352/a.jpg"]
+
+
 # ---------------------------------------------------------------------------
 # Avatars, including archives that have nothing else to migrate
 # ---------------------------------------------------------------------------
@@ -555,7 +607,7 @@ async def test_modern_schema_uses_media_and_versions_and_skips_messages_column(r
             text("UPDATE media_versions SET file_path = '456/old-version.bin'")
         )
 
-    url = str(engine.url)
+    url = engine.url.render_as_string(hide_password=False)
     result = await mod.migrate(url, str(media), dry_run=False)
 
     assert result.status == "applied"
